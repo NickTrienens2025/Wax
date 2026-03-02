@@ -277,6 +277,28 @@ public actor WaxSession {
         return try await textEngine.facts(about: subject, predicate: predicate, asOf: asOf, limit: limit)
     }
 
+    public func edges(
+        from entity: EntityKey,
+        direction: StructuredEdgeDirection,
+        asOf: StructuredMemoryAsOf = .latest,
+        limit: Int = 50
+    ) async throws -> StructuredEdgesResult {
+        guard config.enableStructuredMemory, let textEngine else {
+            throw WaxError.io("structured memory is disabled")
+        }
+        return try await textEngine.edges(from: entity, direction: direction, asOf: asOf, limit: limit)
+    }
+
+    public func walkGraph(
+        from entity: EntityKey,
+        context: StructuredMemoryQueryContext
+    ) async throws -> GraphWalkResult {
+        guard config.enableStructuredMemory, let textEngine else {
+            throw WaxError.io("structured memory is disabled")
+        }
+        return try await textEngine.walkGraph(from: entity, context: context)
+    }
+
     // MARK: - Frames
 
     public func put(

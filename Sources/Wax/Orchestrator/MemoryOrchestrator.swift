@@ -850,6 +850,23 @@ public actor MemoryOrchestrator {
         return try await session.resolveEntities(matchingAlias: alias, limit: limit)
     }
 
+    public func edges(
+        from entity: EntityKey,
+        direction: StructuredEdgeDirection,
+        limit: Int = 50
+    ) async throws -> StructuredEdgesResult {
+        try ensureStructuredMemoryEnabled()
+        return try await session.edges(from: entity, direction: direction, limit: limit)
+    }
+
+    public func walkGraph(
+        from entity: EntityKey,
+        context: StructuredMemoryQueryContext
+    ) async throws -> GraphWalkResult {
+        try ensureStructuredMemoryEnabled()
+        return try await session.walkGraph(from: entity, context: context)
+    }
+
     // MARK: - Persistence lifecycle
 
     public func flush() async throws {

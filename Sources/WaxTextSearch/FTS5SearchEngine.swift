@@ -483,6 +483,147 @@ public actor FTS5SearchEngine {
         }
     }
 
+    // MARK: - Graph Traversal
+
+    /// Returns entity-valued edges from or to the given entity.
+    public func edges(
+        from entity: EntityKey,
+        direction: StructuredEdgeDirection,
+        asOf: StructuredMemoryAsOf = .latest,
+        limit: Int = 50
+    ) async throws -> StructuredEdgesResult {
+        try await flushPendingOpsIfNeeded()
+        let capped = max(0, min(limit, Self.maxResults))
+        let dbQueue = self.dbQueue
+        let entityRaw = entity.rawValue
+        let systemTimeMs = asOf.systemTimeMs
+        let validTimeMs = asOf.validTimeMs
+
+        return try await io.run {
+            try dbQueue.read { db in
+                let sql: String
+                switch direction {
+                case .outbound:
+                    sql = """
+                        SELECT f.fact_id AS fact_id,
+                               p.key AS predicate,
+                               oe.key AS neighbor
+                        FROM sm_fact f
+                        JOIN sm_entity se ON f.subject_entity_id = se.entity_id
+                        JOIN sm_predicate p ON f.predicate_id = p.predicate_id
+                        JOIN sm_entity oe ON f.object_entity_id = oe.entity_id
+                        JOIN sm_fact_span s ON s.fact_id = f.fact_id
+                        WHERE se.key = ? AND f.object_kind = 7
+                          AND s.system_from_ms <= ? AND (s.system_to_ms IS NULL OR s.system_to_ms > ?)
+                          AND s.valid_from_ms <= ? AND (s.valid_to_ms IS NULL OR s.valid_to_ms > ?)
+                        LIMIT ?
+                        """
+                case .inbound:
+                    sql = """
+                        SELECT f.fact_id AS fact_id,
+                               p.key AS predicate,
+                               se.key AS neighbor
+                        FROM sm_fact f
+                        JOIN sm_entity se ON f.subject_entity_id = se.entity_id
+                        JOIN sm_predicate p ON f.predicate_id = p.predicate_id
+                        JOIN sm_entity oe ON f.object_entity_id = oe.entity_id
+                        JOIN sm_fact_span s ON s.fact_id = f.fact_id
+                        WHERE oe.key = ? AND f.object_kind = 7
+                          AND s.system_from_ms <= ? AND (s.system_to_ms IS NULL OR s.system_to_ms > ?)
+                          AND s.valid_from_ms <= ? AND (s.valid_to_ms IS NULL OR s.valid_to_ms > ?)
+                        LIMIT ?
+                        """
+                }
+
+                var args: [any DatabaseValueConvertible] = [entityRaw]
+                args.append(systemTimeMs)
+                args.append(systemTimeMs)
+                args.append(validTimeMs)
+                args.append(validTimeMs)
+                args.append(capped)
+
+                let rows = try Row.fetchAll(db, sql: sql, arguments: StatementArguments(args))
+                let hits: [EdgeHit] = rows.compactMap { row in
+                    guard let factIdValue: Int64 = row["fact_id"] else { return nil }
+                    let predicateRaw: String = row["predicate"] ?? ""
+                    let neighborRaw: String = row["neighbor"] ?? ""
+                    return EdgeHit(
+                        factId: FactRowID(rawValue: factIdValue),
+                        predicate: PredicateKey(predicateRaw),
+                        direction: direction,
+                        neighbor: EntityKey(neighborRaw)
+                    )
+                }
+
+                let wasTruncated = capped > 0 && hits.count >= capped
+                return StructuredEdgesResult(hits: hits, wasTruncated: wasTruncated)
+            }
+        }
+    }
+
+    /// BFS graph walk starting from `entity`, up to `context.maxDepth` hops.
+    ///
+    /// At each hop the method fetches all facts about the current frontier,
+    /// collects supporting evidence frame IDs, and follows entity-valued object
+    /// edges to the next frontier. Visited entities are tracked to prevent cycles.
+    public func walkGraph(
+        from entity: EntityKey,
+        context: StructuredMemoryQueryContext
+    ) async throws -> GraphWalkResult {
+        var visited: Set<EntityKey> = [entity]
+        var frontier: [EntityKey] = [entity]
+        var allHits: [GraphWalkHit] = []
+
+        for hop in 0 ..< context.maxDepth {
+            guard !frontier.isEmpty else { break }
+            var nextFrontier: [EntityKey] = []
+
+            for current in frontier {
+                // Fetch all facts about this entity at the current hop.
+                let factsResult = try await self.facts(
+                    about: current,
+                    predicate: nil,
+                    asOf: context.asOf,
+                    limit: context.maxTraversalEdges
+                )
+
+                // Fetch evidence frame IDs for this entity.
+                let evidenceIds = try await self.evidenceFrameIds(
+                    subjectKeys: [current],
+                    asOf: context.asOf,
+                    maxFacts: context.maxTraversalEdges,
+                    maxFrames: 50,
+                    requireEvidenceSpan: false
+                )
+
+                for factHit in factsResult.hits {
+                    let walkHit = GraphWalkHit(
+                        factId: factHit.factId,
+                        subject: factHit.fact.subject,
+                        predicate: factHit.fact.predicate,
+                        object: factHit.fact.object,
+                        hopDistance: hop,
+                        confidence: nil,
+                        evidenceFrameIds: evidenceIds
+                    )
+                    allHits.append(walkHit)
+
+                    // If the object is an entity, schedule it for the next hop.
+                    if case .entity(let neighbor) = factHit.fact.object {
+                        if visited.insert(neighbor).inserted {
+                            nextFrontier.append(neighbor)
+                        }
+                    }
+                }
+            }
+
+            frontier = nextFrontier
+        }
+
+        let capped = Array(allHits.prefix(context.maxResults))
+        return GraphWalkResult(resolvedEntities: [entity], hits: capped)
+    }
+
     public func serialize(compact: Bool = false) async throws -> Data {
         try await flushPendingOpsIfNeeded()
         let dbQueue = self.dbQueue
