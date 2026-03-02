@@ -830,6 +830,71 @@ public actor MemoryOrchestrator {
         }
     }
 
+    /// Asserts a fact and automatically retracts any existing facts that share
+    /// the same subject and predicate but carry a different object value.
+    ///
+    /// This implements *single-valued predicate* semantics: at most one active
+    /// fact per (subject, predicate) pair is kept at any point in time.  Facts
+    /// whose object already equals `object` are left untouched — no redundant
+    /// retraction is performed and the returned ``ContradictionCheckResult``
+    /// will report `hadContradiction == false`.
+    ///
+    /// - Parameters:
+    ///   - subject: The entity key that is the subject of the fact.
+    ///   - predicate: The relationship being asserted.
+    ///   - object: The new value for the predicate.
+    ///   - validFromMs: Start of the validity window (milliseconds since epoch).
+    ///     Defaults to now.
+    ///   - validToMs: End of the validity window, or `nil` for open-ended.
+    ///   - evidence: Source provenance records for the assertion.
+    ///   - commit: When `true` (the default) a WAL commit is issued after the
+    ///     operation completes so the changes are immediately durable.
+    /// - Returns: A ``ContradictionCheckResult`` describing the newly asserted
+    ///   fact ID and any fact IDs that were retracted.
+    public func assertFactWithContradictionCheck(
+        subject: EntityKey,
+        predicate: PredicateKey,
+        object: FactValue,
+        validFromMs: Int64? = nil,
+        validToMs: Int64? = nil,
+        evidence: [StructuredEvidence] = [],
+        commit: Bool = true
+    ) async throws -> ContradictionCheckResult {
+        try ensureStructuredMemoryEnabled()
+        let nowMs = Int64(Date().timeIntervalSince1970 * 1000)
+
+        // Find all active facts for this subject+predicate pair.
+        let existing = try await session.facts(
+            about: subject,
+            predicate: predicate,
+            asOf: .latest,
+            limit: 100
+        )
+
+        // Retract any fact whose object differs from the one being asserted.
+        var retractedIds: [FactRowID] = []
+        for hit in existing.hits where hit.fact.object != object {
+            try await session.retractFact(factId: hit.factId, atMs: nowMs)
+            retractedIds.append(hit.factId)
+        }
+
+        // Assert the new fact.
+        let valid = StructuredTimeRange(fromMs: validFromMs ?? nowMs, toMs: validToMs)
+        let system = StructuredTimeRange(fromMs: nowMs, toMs: nil)
+        let factId = try await session.assertFact(
+            subject: subject,
+            predicate: predicate,
+            object: object,
+            valid: valid,
+            system: system,
+            evidence: evidence
+        )
+
+        if commit { try await session.commit() }
+
+        return ContradictionCheckResult(factId: factId, retractedFactIds: retractedIds)
+    }
+
     public func facts(
         about subject: EntityKey? = nil,
         predicate: PredicateKey? = nil,
