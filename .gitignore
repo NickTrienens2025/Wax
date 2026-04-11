@@ -42,7 +42,6 @@ Resources/website/build/
 *.xcresult
 
 # Internal tooling (not public-facing)
-CLAUDE.md
 AUDIT_REPORT.md
 /skills/
 /scripts/
