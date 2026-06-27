@@ -293,15 +293,22 @@ public final class BertTokenizer: @unchecked Sendable {
     public func buildModelInputsWithTypeIds(from inputTokens: [Int]) throws -> (MLMultiArray, MLMultiArray, MLMultiArray) {
         let (inputIds, attentionMask) = try buildModelInputs(from: inputTokens)
 
-        var encounteredSep = false
         guard let sepToken = tokenToId(token: "[SEP]") else {
             throw BertTokenizerError.io("Missing required [SEP] token in vocabulary")
         }
+        guard let padToken = tokenToId(token: "[PAD]") else {
+            throw BertTokenizerError.io("Missing required [PAD] token in vocabulary")
+        }
+        var afterFirstSep = false
         let tokenTypeIdValues: [Int] = inputTokens.map { token in
-            if token == sepToken {
-                encounteredSep = true
+            if token == padToken {
+                return 0
             }
-            return encounteredSep ? 1 : 0
+            if token == sepToken {
+                defer { afterFirstSep = true }
+                return afterFirstSep ? 1 : 0
+            }
+            return afterFirstSep ? 1 : 0
         }
         let tokenTypeIds = try MLMultiArray.from(tokenTypeIdValues, dims: 2)
         return (inputIds, attentionMask, tokenTypeIds)
@@ -400,7 +407,11 @@ private extension BertTokenizer {
         }
         vocabCache.lock.unlock()
 
-        guard let url = Bundle.module.url(forResource: "bert_tokenizer_vocab", withExtension: "txt") else {
+        let bundle = WaxBertBundleResolver.resolveModule(
+            named: "Wax_WaxBertTokenizer.bundle",
+            moduleFallback: .module
+        )
+        guard let url = bundle.url(forResource: "bert_tokenizer_vocab", withExtension: "txt") else {
             throw BertTokenizerError.io("Missing vocabulary file: bert_tokenizer_vocab.txt")
         }
         let vocabTxt = try String(contentsOf: url, encoding: .utf8)
@@ -468,17 +479,18 @@ final class BasicTokenizer: @unchecked Sendable {
 
     func tokenize(text: String) -> [String] {
         let foldedText = text.folding(options: .diacriticInsensitive, locale: nil)
-        let splitTokens = foldedText.components(separatedBy: NSCharacterSet.whitespaces)
+        let splitTokens = foldedText.split(whereSeparator: \.isWhitespace)
 
         let tokens: [String] = splitTokens.flatMap { token -> [String] in
-            if neverSplit.contains(token) {
-                return [token]
+            let tokenText = String(token)
+            if neverSplit.contains(tokenText) {
+                return [tokenText]
             }
 
             var tokenFragments: [String] = []
             var currentFragment = ""
 
-            for character in token.lowercased() {
+            for character in tokenText.lowercased() {
                 if character.isLetter || character.isNumber || character == "°" {
                     currentFragment.append(character)
                 } else if !currentFragment.isEmpty {

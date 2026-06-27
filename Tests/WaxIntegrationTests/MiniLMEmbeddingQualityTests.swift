@@ -34,6 +34,23 @@ private enum BaselineFixtureLoader {
     }
 }
 
+private enum MiniLMAssetLoader {
+    static func modelDirectory() -> URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .appendingPathComponent("Sources/WaxVectorSearchMiniLM/Resources/all-MiniLM-L6-v2.mlmodelc")
+    }
+
+    static func modelMIL() throws -> String {
+        try String(
+            contentsOf: modelDirectory().appendingPathComponent("model.mil"),
+            encoding: .utf8
+        )
+    }
+}
+
 private func cosineSimilarity(_ lhs: [Float], _ rhs: [Float]) -> Float {
     var dot: Float = 0
     var lhsNorm: Float = 0
@@ -51,22 +68,32 @@ private func cosineSimilarity(_ lhs: [Float], _ rhs: [Float]) -> Float {
     return denom == 0 ? 0 : (dot / denom)
 }
 
-private func isMiniLMInferenceEnabled() -> Bool {
-    ProcessInfo.processInfo.environment["WAX_TEST_MINILM"] == "1"
+@Test func minilmBundledModelDoesNotUseKnownBadW8A8Quantization() throws {
+    let mil = try MiniLMAssetLoader.modelMIL()
+
+    #expect(
+        !mil.contains("constexpr_blockwise_shift_scale"),
+        "MiniLM model must not use the W8A8 constexpr blockwise quantization path that produced NaN embeddings on macOS 26.3."
+    )
+    #expect(
+        !mil.contains("fp16(nan)"),
+        "MiniLM model must not contain NaN quantization scales."
+    )
 }
 
 @available(macOS 15.0, iOS 18.0, *)
-@Test func minilmEmbeddingsStayCloseToBaseline() async throws {
-    guard isMiniLMInferenceEnabled() else { return }
+@Test(.disabled(
+    if: ProcessInfo.processInfo.environment["WAX_TEST_MINILM"] != "1",
+    "Set WAX_TEST_MINILM=1 to run MiniLM inference quality tests"
+))
+func minilmEmbeddingsStayCloseToBaseline() async throws {
     let fixture = try BaselineFixtureLoader.load()
     #expect(fixture.dimensions == 384)
     #expect(!fixture.sentences.isEmpty)
     #expect(fixture.sentences.count == fixture.embeddings.count)
 
-    let model = try MiniLMEmbeddings()
-    guard let freshEmbeddings = await model.encode(batch: fixture.sentences) else {
-        throw TestingError("MiniLM produced no embeddings")
-    }
+    let embedder = try MiniLMEmbedder()
+    let freshEmbeddings = try await embedder.embed(batch: fixture.sentences)
     #expect(freshEmbeddings.count == fixture.embeddings.count)
 
     var similarities: [Float] = []
@@ -85,11 +112,11 @@ private func isMiniLMInferenceEnabled() -> Bool {
 }
 
 @available(macOS 15.0, iOS 18.0, *)
-@Test func generateMiniLMBaselineFixture() async throws {
-    guard ProcessInfo.processInfo.environment["WAX_GENERATE_MINILM_FIXTURES"] == "1" else {
-        return
-    }
-
+@Test(.disabled(
+    if: ProcessInfo.processInfo.environment["WAX_GENERATE_MINILM_FIXTURES"] != "1",
+    "Set WAX_GENERATE_MINILM_FIXTURES=1 to regenerate MiniLM baseline fixtures"
+))
+func generateMiniLMBaselineFixture() async throws {
     let sentences = [
         "Swift concurrency makes structured parallelism practical.",
         "Vector search underpins modern retrieval-augmented generation.",
@@ -101,10 +128,8 @@ private func isMiniLMInferenceEnabled() -> Bool {
         "On-device inference keeps user data private."
     ]
 
-    let model = try MiniLMEmbeddings()
-    guard let embeddings = await model.encode(batch: sentences) else {
-        throw TestingError("MiniLM produced no embeddings")
-    }
+    let embedder = try MiniLMEmbedder()
+    let embeddings = try await embedder.embed(batch: sentences)
 
     let fixture = BaselineEmbeddingFixture(
         sentences: sentences,

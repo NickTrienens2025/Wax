@@ -41,6 +41,26 @@ package enum BrokerCorpusStoreBuilder {
             recursive: recursive,
             excluding: [standardizedTarget.path]
         )
+        let buildConfiguration = CorpusBuildManifest.BuildConfiguration(
+            noEmbedder: noEmbedder,
+            embedderChoice: embedderChoice,
+            recursive: recursive
+        )
+        let sourceFingerprints = try CorpusBuildManifestStore.fingerprints(for: storeURLs)
+        if fileManager.fileExists(atPath: standardizedTarget.path),
+           let manifest = try CorpusBuildManifestStore.load(for: standardizedTarget),
+           manifest.version == CorpusBuildManifest.currentVersion,
+           manifest.configuration == buildConfiguration,
+           manifest.sources == sourceFingerprints {
+            return BrokerCorpusBuildSummary(
+                storesDiscovered: storeURLs.count,
+                storesIndexed: 0,
+                storesSkipped: 0,
+                documentsIndexed: 0,
+                documentsSkipped: 0,
+                targetStorePath: standardizedTarget.path
+            )
+        }
 
         let buildURL = temporaryBuildURL(for: standardizedTarget)
         if fileManager.fileExists(atPath: buildURL.path) {
@@ -67,6 +87,7 @@ package enum BrokerCorpusStoreBuilder {
                     outcome = try await ingestSourceStore(
                         at: storeURL,
                         into: memory,
+                        noEmbedder: noEmbedder,
                         embedderChoice: embedderChoice,
                         embedderTuning: embedderTuning
                     )
@@ -90,10 +111,19 @@ package enum BrokerCorpusStoreBuilder {
             throw error
         }
 
-        if fileManager.fileExists(atPath: standardizedTarget.path) {
-            try fileManager.removeItem(at: standardizedTarget)
+        try replaceExistingCorpusStore(at: standardizedTarget, with: buildURL)
+        if storesSkipped == 0 {
+            try CorpusBuildManifestStore.save(
+                CorpusBuildManifest(
+                    configuration: buildConfiguration,
+                    sources: sourceFingerprints,
+                    generatedAtMs: Int64(Date().timeIntervalSince1970 * 1000)
+                ),
+                for: standardizedTarget
+            )
+        } else {
+            try? CorpusBuildManifestStore.delete(for: standardizedTarget)
         }
-        try fileManager.moveItem(at: buildURL, to: standardizedTarget)
 
         return BrokerCorpusBuildSummary(
             storesDiscovered: storeURLs.count,
@@ -115,6 +145,7 @@ private extension BrokerCorpusStoreBuilder {
     static func ingestSourceStore(
         at sourceStoreURL: URL,
         into targetMemory: MemoryOrchestrator,
+        noEmbedder: Bool,
         embedderChoice: String,
         embedderTuning: CommandLineEmbedderRuntimeTuning
     ) async throws -> IngestOutcome {
@@ -131,8 +162,23 @@ private extension BrokerCorpusStoreBuilder {
             }
         }
         let sourceDocuments = try await sourceMemory.corpusSourceDocuments()
-        var indexedDocuments = 0
+        if noEmbedder {
+            try await targetMemory.ingestCorpusDocumentsTextOnly(
+                sourceDocuments.map { document in
+                    MemoryOrchestrator.CorpusTargetDocument(
+                        timestampMs: document.timestampMs,
+                        text: document.text,
+                        metadata: corpusMetadata(from: document, sourceStoreURL: sourceStoreURL)
+                    )
+                }
+            )
+            return IngestOutcome(
+                indexedDocuments: sourceDocuments.count,
+                skippedDocuments: 0
+            )
+        }
 
+        var indexedDocuments = 0
         for document in sourceDocuments {
             try await targetMemory.remember(
                 document.text,
@@ -141,10 +187,7 @@ private extension BrokerCorpusStoreBuilder {
             indexedDocuments += 1
         }
 
-        return IngestOutcome(
-            indexedDocuments: indexedDocuments,
-            skippedDocuments: 0
-        )
+        return IngestOutcome(indexedDocuments: indexedDocuments, skippedDocuments: 0)
     }
 
     static func corpusMetadata(
@@ -229,6 +272,42 @@ private extension BrokerCorpusStoreBuilder {
         let stem = targetURL.deletingPathExtension().lastPathComponent
         return directory
             .appendingPathComponent("\(stem)-building-\(UUID().uuidString)")
+            .appendingPathExtension("wax")
+    }
+
+    static func replaceExistingCorpusStore(at targetURL: URL, with buildURL: URL) throws {
+        let fileManager = FileManager.default
+        let backupURL = temporaryBackupURL(for: targetURL)
+        if fileManager.fileExists(atPath: backupURL.path) {
+            try fileManager.removeItem(at: backupURL)
+        }
+
+        var movedExistingStore = false
+
+        do {
+            if fileManager.fileExists(atPath: targetURL.path) {
+                try fileManager.moveItem(at: targetURL, to: backupURL)
+                movedExistingStore = true
+            }
+
+            try fileManager.moveItem(at: buildURL, to: targetURL)
+
+            if movedExistingStore {
+                try? fileManager.removeItem(at: backupURL)
+            }
+        } catch {
+            if movedExistingStore, !fileManager.fileExists(atPath: targetURL.path) {
+                try? fileManager.moveItem(at: backupURL, to: targetURL)
+            }
+            throw error
+        }
+    }
+
+    static func temporaryBackupURL(for targetURL: URL) -> URL {
+        let directory = targetURL.deletingLastPathComponent()
+        let stem = targetURL.deletingPathExtension().lastPathComponent
+        return directory
+            .appendingPathComponent("\(stem)-backup-\(UUID().uuidString)")
             .appendingPathExtension("wax")
     }
 

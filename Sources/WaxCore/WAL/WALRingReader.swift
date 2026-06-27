@@ -93,12 +93,6 @@ package final class WALRingReader {
         var pendingBytes: UInt64 = 0
         var wrapped = false
         var pendingMutations: [PendingMutation] = []
-        // When a pending-entry decode error occurs we stop collecting pending mutations
-        // but continue advancing the cursor so writePos/pendingBytes remain accurate
-        // for WAL recovery position tracking. This preserves the old package behavior:
-        // a corrupt pending entry does not prevent the state-position scan from reaching
-        // the true end of the ring.
-        var stopDecodingPendingMutations = false
 
         while true {
             let remaining = walSize - cursor
@@ -162,17 +156,11 @@ package final class WALRingReader {
                 break
             }
 
-            if header.sequence > committedSeq && !stopDecodingPendingMutations {
-                do {
-                    let entry = try WALEntryCodec.decode(payload, offset: cursor)
-                    pendingMutations.append(PendingMutation(sequence: header.sequence, entry: entry))
-                } catch {
-                    // Treat decode failure as corruption for this pending entry: stop collecting
-                    // mutations but continue the state-position scan so writePos/pendingBytes
-                    // remain accurate. A mid-ring corrupt pending entry is non-fatal for
-                    // position tracking.
-                    stopDecodingPendingMutations = true
-                }
+            if header.sequence > committedSeq {
+                // Do not silently skip checksum-valid but undecodable payloads.
+                // Advancing replay state past them would permanently drop committed mutations.
+                let entry = try WALEntryCodec.decode(payload, offset: cursor)
+                pendingMutations.append(PendingMutation(sequence: header.sequence, entry: entry))
             }
 
             let advance = UInt64(WALRecord.headerSize) + payloadLen

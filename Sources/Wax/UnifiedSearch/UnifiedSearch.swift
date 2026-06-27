@@ -55,7 +55,7 @@ extension Wax {
             includeVector = true
         }
 
-        let candidateLimit = Self.candidateLimit(for: requestedTopK)
+        let candidateLimit = Self.candidateLimit(for: requestedTopK, filter: filter)
         let cache = UnifiedSearchEngineCache.shared
         let textEngine: FTS5SearchEngine? = if includeText {
             if let override = engineOverrides?.textEngine {
@@ -123,17 +123,24 @@ extension Wax {
             }
 
             do {
-                let base = try await textEngine.search(query: primaryQuery, topK: candidateLimit)
+                let base = if primaryQuery == trimmedQuery {
+                    try await textEngine.search(query: primaryQuery, topK: candidateLimit)
+                } else {
+                    try await textEngine.search(matchQuery: primaryQuery, topK: candidateLimit)
+                }
                 guard let fallbackQuery, fallbackQuery != primaryQuery else {
                     return Array(base.prefix(candidateLimit))
                 }
-                let fallback = try await textEngine.search(query: fallbackQuery, topK: candidateLimit)
+                let fallback = try await textEngine.search(matchQuery: fallbackQuery, topK: candidateLimit)
+                if base.isEmpty {
+                    return Array(fallback.prefix(candidateLimit))
+                }
                 return merged(base: base, fallback: fallback, limit: candidateLimit)
             } catch {
                 guard let fallbackQuery else {
                     throw error
                 }
-                return try await textEngine.search(query: fallbackQuery, topK: candidateLimit)
+                return try await textEngine.search(matchQuery: fallbackQuery, topK: candidateLimit)
             }
         }()
 
@@ -186,8 +193,7 @@ extension Wax {
             )
             guard !candidates.isEmpty else { return [] }
 
-            let asOfMs = request.timeRange?.before ?? request.asOfMs
-            let asOf = StructuredMemoryAsOf(asOfMs: asOfMs)
+            let asOf = StructuredMemoryAsOf(asOfMs: request.asOfMs)
             return try await structuredEngine.evidenceFrameIds(
                 subjectKeys: candidates,
                 asOf: asOf,
@@ -495,7 +501,13 @@ extension Wax {
                 previewText: previewText,
                 sources: item.sources,
                 rankingDiagnostics: rankingDiagnostics,
-                metadata: item.metadata
+                metadata: item.metadata,
+                explanations: Self.baseExplanations(
+                    sources: item.sources,
+                    rankingDiagnostics: rankingDiagnostics,
+                    metadata: item.metadata,
+                    scopeContext: request.scopeContext
+                )
             )
         }
 
@@ -506,6 +518,11 @@ extension Wax {
                 maxWindow: min(max(request.topK * 2, 10), 32)
             )
         }
+        filtered = Self.semanticMemoryRerank(
+            results: filtered,
+            scopeContext: request.scopeContext,
+            maxWindow: min(max(request.topK * 3, 12), 48)
+        )
 
         if filtered.isEmpty, request.allowTimelineFallback {
             filtered = await timelineFallbackResults(request: request, filter: filter)
@@ -563,7 +580,13 @@ extension Wax {
                     score: score,
                     previewText: previewText,
                     sources: [.timeline],
-                    metadata: meta.metadata?.entries ?? [:]
+                    metadata: meta.metadata?.entries ?? [:],
+                    explanations: Self.baseExplanations(
+                        sources: [.timeline],
+                        rankingDiagnostics: nil,
+                        metadata: meta.metadata?.entries ?? [:],
+                        scopeContext: request.scopeContext
+                    )
                 )
             )
 
@@ -573,6 +596,110 @@ extension Wax {
         }
 
         return results
+    }
+
+    private static func semanticMemoryRerank(
+        results: [SearchResponse.Result],
+        scopeContext: MemoryScopeContext?,
+        nowMs: Int64 = Int64(Date().timeIntervalSince1970 * 1000),
+        maxWindow: Int
+    ) -> [SearchResponse.Result] {
+        let cappedWindow = min(max(0, maxWindow), results.count)
+        guard cappedWindow > 0 else { return results }
+
+        let scoredHead = results.prefix(cappedWindow).enumerated().compactMap { index, result -> (index: Int, composite: Float, adjustment: Float, result: SearchResponse.Result)? in
+            let semantic = MemorySemantics.rankingReasons(
+                metadata: result.metadata,
+                scope: scopeContext,
+                nowMs: nowMs
+            )
+            guard semantic.adjustment > -9.5 else { return nil }
+            var updated = result
+            if !semantic.reasons.isEmpty {
+                updated.explanations = dedupedExplanations(result.explanations + semantic.reasons)
+            }
+            return (index: index, composite: result.score + semantic.adjustment, adjustment: semantic.adjustment, result: updated)
+        }
+
+        guard !scoredHead.isEmpty else { return Array(results.dropFirst(cappedWindow)) }
+        let meaningfulAdjustmentExists = scoredHead.contains { abs($0.adjustment) >= 0.11 }
+        guard meaningfulAdjustmentExists else {
+            let retained = scoredHead.sorted { $0.index < $1.index }.map(\.result)
+            if cappedWindow == results.count {
+                return retained
+            }
+            var combined = retained
+            combined.reserveCapacity(results.count)
+            combined.append(contentsOf: results.dropFirst(cappedWindow).filter {
+                !MemorySemantics.parse(metadata: $0.metadata, nowMs: nowMs).isExpired
+            })
+            return combined
+        }
+
+        let rankedHead = scoredHead.sorted { lhs, rhs in
+            if lhs.composite != rhs.composite { return lhs.composite > rhs.composite }
+            if lhs.result.score != rhs.result.score { return lhs.result.score > rhs.result.score }
+            return lhs.index < rhs.index
+        }.map(\.result)
+
+        if cappedWindow == results.count {
+            return rankedHead
+        }
+        var combined = rankedHead
+        combined.reserveCapacity(results.count)
+        combined.append(contentsOf: results.dropFirst(cappedWindow).filter {
+            !MemorySemantics.parse(metadata: $0.metadata, nowMs: nowMs).isExpired
+        })
+        return combined
+    }
+
+    private static func baseExplanations(
+        sources: [SearchResponse.Source],
+        rankingDiagnostics: SearchResponse.RankingDiagnostics?,
+        metadata: [String: String],
+        scopeContext: MemoryScopeContext?,
+        nowMs: Int64 = Int64(Date().timeIntervalSince1970 * 1000)
+    ) -> [String] {
+        var reasons: [String] = []
+        if sources.contains(.vector) {
+            reasons.append("semantic match")
+        }
+        if sources.contains(.text) {
+            reasons.append("keyword match")
+        }
+        if sources.contains(.structuredMemory) {
+            reasons.append("linked entity or fact evidence")
+        }
+        if sources.contains(.timeline) {
+            reasons.append("timeline fallback")
+        }
+        if let rankingDiagnostics {
+            if let bestLane = rankingDiagnostics.bestLaneRank, bestLane == 1 {
+                reasons.append("top lane result")
+            }
+            if rankingDiagnostics.tieBreakReason == SearchResponse.RankingTieBreakReason.rerankComposite {
+                reasons.append("intent-aware rerank")
+            }
+        }
+        let semantic = MemorySemantics.rankingReasons(
+            metadata: metadata,
+            scope: scopeContext,
+            nowMs: nowMs
+        )
+        reasons.append(contentsOf: semantic.reasons)
+        return dedupedExplanations(reasons)
+    }
+
+    private static func dedupedExplanations(_ reasons: [String]) -> [String] {
+        var seen = Set<String>()
+        var ordered: [String] = []
+        ordered.reserveCapacity(reasons.count)
+        for reason in reasons {
+            let normalized = reason.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !normalized.isEmpty, seen.insert(normalized).inserted else { continue }
+            ordered.append(normalized)
+        }
+        return ordered
     }
 
     private static func orExpandedQuery(from query: String, maxTokens: Int = 16) -> String? {
@@ -1225,6 +1352,24 @@ extension Wax {
         let expanded = topK > Int.max / 3 ? Int.max : topK * 3
         let capped = min(expanded, 1000)
         return max(topK, capped)
+    }
+
+    private static func candidateLimit(for topK: Int, filter: FrameFilter) -> Int {
+        let baseLimit = candidateLimit(for: topK)
+        guard needsCallerFilterOverfetch(filter) else { return baseLimit }
+
+        let multiplied = topK > Int.max / 5 ? Int.max : topK * 5
+        let withSlack = topK > Int.max - 200 ? Int.max : topK + 200
+        let overfetchLimit = min(1000, max(multiplied, withSlack))
+        return max(baseLimit, overfetchLimit)
+    }
+
+    private static func needsCallerFilterOverfetch(_ filter: FrameFilter) -> Bool {
+        if filter.frameIds != nil { return true }
+        guard let metadataFilter = filter.metadataFilter else { return false }
+        return !metadataFilter.requiredEntries.isEmpty
+            || !metadataFilter.requiredTags.isEmpty
+            || !metadataFilter.requiredLabels.isEmpty
     }
 
     private static func frameIDsAndSet<S: Sequence>(from frameIDs: S) -> ([UInt64], Set<UInt64>)
